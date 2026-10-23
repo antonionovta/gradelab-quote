@@ -10,6 +10,7 @@ import html as htmlmod
 import json
 import re
 import sys
+import time
 import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -54,13 +55,54 @@ def parse_brainy(page):
     return _pick(links)
 
 
+def fetch_page():
+    """GET the quote-of-the-day page, retrying transient blocks.
+    BrainyQuote's bot wall intermittently 403s datacenter IPs
+    (GitHub's runners included); a retry a minute later, or the
+    next scheduled run on a fresh runner, usually gets through."""
+    headers = {"User-Agent": UA,
+               "Accept": "text/html,application/xhtml+xml",
+               "Accept-Language": "en-US,en;q=0.9"}
+    last = None
+    for attempt, wait in enumerate((0, 30, 90)):
+        if wait:
+            time.sleep(wait)
+        try:
+            req = urllib.request.Request(URL, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status != 200:
+                    print(f"attempt {attempt + 1}: HTTP {resp.status}", file=sys.stderr)
+                    continue
+                return resp.read().decode("utf-8", "ignore")
+        except Exception as e:
+            last = e
+            print(f"attempt {attempt + 1}: {e}", file=sys.stderr)
+    if last:
+        raise last
+    return None
+
+
 def main():
-    req = urllib.request.Request(URL, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        if resp.status != 200:
-            print(f"HTTP {resp.status} from BrainyQuote", file=sys.stderr)
-            return 1
-        page = resp.read().decode("utf-8", "ignore")
+    fetch_err = None
+    try:
+        page = fetch_page()
+    except Exception as e:
+        page, fetch_err = None, e
+    if not page:
+        # Nothing to fetch with -- but if quote.json already
+        # carries today's quote, this run has nothing to do:
+        # stand down quietly instead of failing red.
+        today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        try:
+            with open(OUT, encoding="utf-8") as f:
+                old = json.load(f)
+            if old.get("date") == today:
+                print(f"fetch failed ({fetch_err}) but quote.json already has today's quote; standing down")
+                return 0
+        except Exception:
+            pass
+        print(f"fetch failed: {fetch_err}", file=sys.stderr)
+        return 1
     got = parse_brainy(page)
     if not got:
         print("Could not parse the Funny Quote of the Day -- markup may have changed", file=sys.stderr)
