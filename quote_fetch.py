@@ -5,20 +5,35 @@ Runs in GitHub Actions (see .github/workflows/quote.yml). Stdlib only.
 On any failure -- network, markup change, validation -- it exits
 nonzero WITHOUT touching quote.json, so the last good quote keeps
 serving and the failed run shows up red in the Actions tab.
+
+Resilience (added after the Oct 24 AM runs failed twice while the
+same fetch worked elsewhere -- GitHub's datacenter IPs get bot
+challenges that a single request can't ride out): each run tries
+up to 3 rounds across two browser user agents, with a growing
+sleep between rounds, and logs exactly which stage failed so the
+next failed run's log names the cause instead of guessing.
 """
 import html as htmlmod
 import json
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 URL = "https://www.brainyquote.com/quote_of_the_day"
-UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 "
-      "Mobile/15E148 Safari/604.1")
+UAS = [
+    ("iphone",
+     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 "
+     "Mobile/15E148 Safari/604.1"),
+    ("chrome",
+     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+     "AppleWebKit/537.36 (KHTML, like Gecko) "
+     "Chrome/130.0.0.0 Safari/537.36"),
+]
 OUT = "quote.json"
 
 
@@ -55,57 +70,49 @@ def parse_brainy(page):
     return _pick(links)
 
 
-def fetch_page():
-    """GET the quote-of-the-day page, retrying transient blocks.
-    BrainyQuote's bot wall intermittently 403s datacenter IPs
-    (GitHub's runners included); a retry a minute later, or the
-    next scheduled run on a fresh runner, usually gets through."""
-    headers = {"User-Agent": UA,
-               "Accept": "text/html,application/xhtml+xml",
-               "Accept-Language": "en-US,en;q=0.9"}
-    last = None
-    for attempt, wait in enumerate((0, 30, 90)):
-        if wait:
-            time.sleep(wait)
-        try:
-            req = urllib.request.Request(URL, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                if resp.status != 200:
-                    print(f"attempt {attempt + 1}: HTTP {resp.status}", file=sys.stderr)
-                    continue
-                return resp.read().decode("utf-8", "ignore")
-        except Exception as e:
-            last = e
-            print(f"attempt {attempt + 1}: {e}", file=sys.stderr)
-    if last:
-        raise last
+def fetch_quote():
+    """(quote, author) via retries + UA fallback, or None.
+
+    A bot-challenge page usually arrives as a non-200, or as a 200
+    whose markup has no Funny block -- both are treated as "try the
+    next agent", never as a reason to clobber quote.json."""
+    last_err = "no attempt made"
+    for attempt in range(3):
+        for label, ua in UAS:
+            try:
+                req = urllib.request.Request(URL, headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "en-US,en;q=0.9",
+                })
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    if resp.status != 200:
+                        print(f"Round {attempt + 1} ({label}): HTTP {resp.status}", file=sys.stderr)
+                        last_err = f"HTTP {resp.status}"
+                        continue
+                    page = resp.read().decode("utf-8", "ignore")
+            except urllib.error.HTTPError as e:
+                print(f"Round {attempt + 1} ({label}): HTTP {e.code}", file=sys.stderr)
+                last_err = f"HTTP {e.code}"
+                continue
+            except Exception as e:
+                print(f"Round {attempt + 1} ({label}): {type(e).__name__}: {e}", file=sys.stderr)
+                last_err = f"{type(e).__name__}: {e}"
+                continue
+            got = parse_brainy(page)
+            if got:
+                return got
+            print(f"Round {attempt + 1} ({label}): page fetched but no Funny quote found", file=sys.stderr)
+            last_err = "parse failed"
+        if attempt < 2:
+            time.sleep(20 * (attempt + 1))
+    print(f"All fetch attempts failed (last: {last_err})", file=sys.stderr)
     return None
 
 
 def main():
-    fetch_err = None
-    try:
-        page = fetch_page()
-    except Exception as e:
-        page, fetch_err = None, e
-    if not page:
-        # Nothing to fetch with -- but if quote.json already
-        # carries today's quote, this run has nothing to do:
-        # stand down quietly instead of failing red.
-        today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-        try:
-            with open(OUT, encoding="utf-8") as f:
-                old = json.load(f)
-            if old.get("date") == today:
-                print(f"fetch failed ({fetch_err}) but quote.json already has today's quote; standing down")
-                return 0
-        except Exception:
-            pass
-        print(f"fetch failed: {fetch_err}", file=sys.stderr)
-        return 1
-    got = parse_brainy(page)
+    got = fetch_quote()
     if not got:
-        print("Could not parse the Funny Quote of the Day -- markup may have changed", file=sys.stderr)
         return 1
     quote, author = got
     data = {
