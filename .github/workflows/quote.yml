@@ -1,17 +1,14 @@
 name: Quote of the day
 
 # Fetches BrainyQuote's Funny Quote of the Day server-side and
-# publishes quote.json, which the GradeLab app reads. Runs a few
-# times a day so BrainyQuote's US-time rollover is always caught;
-# a failed fetch leaves the last good quote.json untouched.
+# publishes quote.json, which the GradeLab app reads. The scheduled
+# runs are disabled: a VM cron now does the fetching, so this
+# workflow is a manual fallback only (workflow_dispatch).
+# A failed fetch leaves the last good quote.json untouched.
 on:
-  schedule:
-    - cron: '30 5,9,13,17,21 * * *'
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   quote:
     runs-on: ubuntu-latest
